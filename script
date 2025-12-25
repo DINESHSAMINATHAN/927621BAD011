@@ -1,0 +1,121 @@
+
+# Output paths
+$doc   = [Environment]::GetFolderPath('MyDocuments')
+$outDir= Join-Path $doc 'ServerHealthReports'
+$outHtml= Join-Path $outDir 'ServerHealthReport.html'
+$outXlsx= Join-Path $outDir 'ServerHealthReport.xlsx'
+New-Item -Path $outDir -ItemType Directory -Force | Out-Null
+
+# Thresholds
+$DiskFreeMin = 80      # Free% >= 80 => green else red
+$CpuRedAbove = 10      # Load% > 10 => red else green
+$MemUsedRedAbove = 50  # Used% > 50 => red else green
+
+# ------------ Collect Data ------------
+# Disk
+$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
+    $size=[math]::Round($_.Size/1GB,2)
+    $free=[math]::Round($_.FreeSpace/1GB,2)
+    $freePct=[math]::Round(($_.FreeSpace/$_.Size)*100,2)
+    [pscustomobject]@{Drive=$_.DeviceID;TotalGB=$size;FreeGB=$free;FreePct=$freePct}
+}
+
+# CPU
+$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).LoadPercentage
+
+# Memory
+$os = Get-CimInstance Win32_OperatingSystem
+$total=[math]::Round(($os.TotalVisibleMemorySize*1KB)/1GB,2)
+$free =[math]::Round(($os.FreePhysicalMemory*1KB)/1GB,2)
+$usedPct=[math]::Round((($total-$free)/$total)*100,2)
+
+# ------------ HTML (compact) ------------
+$diskRows = $disks | ForEach-Object {
+    "<tr><td>$($_.Drive)</td><td>$($_.TotalGB)</td><td>$($_.FreeGB)</td><td class='$(if($_.FreePct -ge $DiskFreeMin){'good'}else{'bad'})'>$($_.FreePct)%</td></tr>"
+}
+
+$cpuRow = "<tr><td>CPU</td><td class='$(if($cpu -gt $CpuRedAbove){'bad'}else{'good'})'>$cpu%</td></tr>"
+$memRow = "<tr><td>Memory</td><td>$total GB</td><td>$free GB</td><td class='$(if($usedPct -gt $MemUsedRedAbove){'bad'}else{'good'})'>$usedPct%</td></tr>"
+
+$html = @"
+<html><head>
+<style>
+table{border-collapse:collapse}td,th{border:1px solid #555;padding:5px}
+.good{background:#d4edda}.bad{background:#f8d7da}
+</style></head><body>
+<h2>Disk</h2><table><tr><th>Drive</th><th>Total(GB)</th><th>Free(GB)</th><th>Free%</th></tr>$($diskRows -join "`n")</table>
+<h2>CPU</h2><table><tr><th>Metric</th><th>Value</th></tr>$cpuRow</table>
+<h2>Memory</h2><table><tr><th>Metric</th><th>Total</th><th>Free</th><th>Used%</th></tr>$memRow</table>
+</body></html>
+"@
+$html | Set-Content $outHtml -Encoding UTF8
+
+# ------------ Excel (.xlsx) with same colors ------------
+# Requires Excel installed
+$xl = New-Object -ComObject Excel.Application
+$xl.Visible = $false
+$wb = $xl.Workbooks.Add()
+
+# Helper to set a cell's background color (RGB)
+function Set-CellColor { param($cell,$isGood)
+    # Light green / light red
+    if ($isGood) { $cell.Interior.Color = 0x00D4EDDA } else { $cell.Interior.Color = 0x00F8D7DA }
+}
+
+# Sheet 1: Disk
+$shDisk = $wb.Worksheets.Item(1); $shDisk.Name = 'Disk'
+$headers = 'Drive','Total(GB)','Free(GB)','Free(%)'
+for($c=0;$c -lt $headers.Count;$c++){ $shDisk.Cells.Item(1,$c+1).Value2 = $headers[$c] }
+$row=2
+foreach($d in $disks){
+    $shDisk.Cells.Item($row,1).Value2 = $d.Drive
+    $shDisk.Cells.Item($row,2).Value2 = $d.TotalGB
+    $shDisk.Cells.Item($row,3).Value2 = $d.FreeGB
+    $cellPct = $shDisk.Cells.Item($row,4); $cellPct.Value2 = $d.FreePct
+    Set-CellColor -cell $cellPct -isGood ($d.FreePct -ge $DiskFreeMin)
+    $row++
+}
+$shDisk.Range("A1:D1").Font.Bold = $true
+$shDisk.Columns.AutoFit() | Out-Null
+
+# Sheet 2: CPU
+$shCpu = $wb.Worksheets.Add(); $shCpu.Name='CPU'
+$shCpu.Cells.Item(1,1).Value2='Metric'
+$shCpu.Cells.Item(1,2).Value2='Value(%)'
+$shCpu.Cells.Item(2,1).Value2='CPU'
+$cpuCell = $shCpu.Cells.Item(2,2); $cpuCell.Value2=$cpu
+Set-CellColor -cell $cpuCell -isGood ($cpu -le $CpuRedAbove)
+$shCpu.Range("A1:B1").Font.Bold = $true
+$shCpu.Columns.AutoFit() | Out-Null
+
+# Sheet 3: Memory
+$shMem = $wb.Worksheets.Add(); $shMem.Name='Memory'
+$shMem.Cells.Item(1,1).Value2='Metric'
+$shMem.Cells.Item(1,2).Value2='Total(GB)'
+$shMem.Cells.Item(1,3).Value2='Free(GB)'
+$shMem.Cells.Item(1,4).Value2='Used(%)'
+$shMem.Cells.Item(2,1).Value2='Memory'
+$shMem.Cells.Item(2,2).Value2=$total
+$shMem.Cells.Item(2,3).Value2=$free
+$memCell = $shMem.Cells.Item(2,4); $memCell.Value2=$usedPct
+Set-CellColor -cell $memCell -isGood ($usedPct -le $MemUsedRedAbove)
+$shMem.Range("A1:D1").Font.Bold = $true
+$shMem.Columns.AutoFit() | Out-Null
+
+# Save & close
+$wb.SaveAs($outXlsx) | Out-Null
+$wb.Close($true); $xl.Quit()
+
+# Release COM
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($memCell) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($shMem) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($cpuCell) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($shCpu) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($shDisk) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+[GC]::Collect(); [GC]::WaitForPendingFinalizers()
+
+# Auto-open both
+Start-Process $outHtml
+Start-Process $outXlsx
